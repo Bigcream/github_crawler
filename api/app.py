@@ -1,16 +1,18 @@
 import json
 
 import psycopg2
+import schedule
 from flask import Flask, jsonify, request
 from scrapy.crawler import CrawlerProcess
-
+import time
 from api.config import Config
+from crawler.GitHubReleasesSpider import GitHubReleasesSpider
 from crawler.repo_spider import RepoSpider
 from crawler.spider import ReleasesSpider
 
 app = Flask(__name__)
 
-
+is_running = False
 # Kết nối PostgreSQL
 def get_db_connection():
     return psycopg2.connect(
@@ -35,8 +37,10 @@ def fetch_top_repos():
     # Nếu chưa đủ số lượng, chạy crawler
     if current_count < limit:
         process = CrawlerProcess()
+        # process.crawl(GitHubReleasesSpider)
         process.crawl(RepoSpider, limit=limit)
         process.start()  # Chạy đồng bộ
+
 
     # Lấy dữ liệu từ DB
     cursor.execute("SELECT id, \"user\", name, star FROM repo LIMIT %s", (limit,))
@@ -98,5 +102,32 @@ def get_commits(release_id):
     return jsonify({"status": "success", "release_id": release_id, "commits": commits})
 
 
+def run_spider():
+    global is_running
+    if is_running:
+        print("Đã có một spider đang chạy. Bỏ qua lần chạy này.")
+        return
+
+    try:
+        is_running = True
+        print("Bắt đầu chạy spider để thu thập dữ liệu từ GitHub...")
+        process = CrawlerProcess()
+        process.crawl(RepoSpider, limit=5000)  # Có thể thay đổi limit nếu cần
+        process.start()
+        print("Đã hoàn thành thu thập dữ liệu.")
+    finally:
+        is_running = False  # Đặt lại trạng thái sau khi hoàn thành
+
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+    # schedule.every().minute.do(run_spider)
+    #
+    # # Ví dụ khác:
+    # # schedule.every().minute.do(run_spider)  # Chạy mỗi phút (dùng để test)
+    # # schedule.every().hour.do(run_spider)  # Chạy mỗi giờ
+    #
+    # print("Đã kích hoạt lịch trình. Đang chờ đến thời gian chạy tiếp theo...")
+    # while True:
+    #     schedule.run_pending()
+    #     time.sleep(60)  # Kiểm tra mỗi phút

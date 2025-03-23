@@ -8,8 +8,13 @@ ROBOTSTXT_OBEY = False
 
 
 class Settings:
-    token = os.getenv("GITHUB_TOKEN")  # Thay bằng token thực tế
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Thay bằng token thực tế
     HEADERS = {
-        "Authorization": f"token {token}",
+        "Authorization": f"token {GITHUB_TOKEN}",
         "User-Agent": "GitHubCrawler/1.0"
     }
+
+    # Tùy chọn tối ưu hóa
+    # RETRY_TIMES = 5
+    # RETRY_HTTP_CODES = [500, 503, 504, 400, 403, 404, 408]
+    DOWNLOAD_DELAY = 2  # Tăng delay để tránh bị chặn
