@@ -14,14 +14,15 @@ class RepoSpider(scrapy.Spider):
         "USER_AGENT": "GitHubCrawler/1.0",
         "DOWNLOAD_DELAY": 2,  # Reduced delay for faster crawling
         "LOG_LEVEL": "DEBUG",
-        "CONCURRENT_REQUESTS": 100,  # Increased to handle 100 parallel requests
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 50,  # Increased for GitHub API
+        "CONCURRENT_REQUESTS": 10,  # Increased to handle 100 parallel requests
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 10,  # Increased for GitHub API
         "DOWNLOADER_MIDDLEWARES": {
             'crawler.middleware.rate_limit_middleware.RateLimitMiddleware': 100,
         },
         "SPIDER_MIDDLEWARES": {
             'scrapy.spidermiddlewares.referer.RefererMiddleware': None,
         },
+        "DOWNLOAD_TIMEOUT": 10,  # Timeout 30 giây
         "AUTOTHROTTLE_ENABLED": True,  # Helps manage load on GitHub API
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 10.0,
     }
@@ -39,7 +40,7 @@ class RepoSpider(scrapy.Spider):
             password=Config.DB_PASSWORD,
             port=Config.DB_PORT
         )
-        self.executor = ThreadPoolExecutor(max_workers=4)  # Thread pool for DB writes
+        self.executor = ThreadPoolExecutor(max_workers=8)  # Thread pool for DB writes
         self.after_cursor = None
         self.last_star = None
         self.total_crawled = 0
@@ -109,9 +110,11 @@ class RepoSpider(scrapy.Spider):
             return
 
         repo_data = []
-        release_data = []
+        release_repo_map = {}  # Ánh xạ giữa repo index và release content
         commit_requests = []
-        for edge in repos:
+
+        # Thu thập dữ liệu repository và release
+        for idx, edge in enumerate(repos):
             repo = edge['node']
             user = repo['owner']['login']
             name = repo['name']
@@ -124,39 +127,45 @@ class RepoSpider(scrapy.Spider):
             if releases:
                 release = releases[0]
                 release_content = f"{release['name']} - {release['tagName']} - {release['publishedAt']} - {release['description']}"
-                release_data.append((release_content, None))
+                release_repo_map[idx] = release_content  # Gán release content với chỉ số repo
                 tag_name = release['tagName']
                 if tag_name:
-                    commit_requests.append((user, name, tag_name))
+                    commit_requests.append((user, name, tag_name, idx))  # Lưu idx để ánh xạ sau
 
-        # Offload repo insertion to thread pool
+        # Chèn repo và lấy repo_ids
         if repo_data:
             future = self.executor.submit(self.batch_insert_repos, repo_data)
-            repo_ids = future.result()  # Blocking but offloaded to thread
+            repo_ids = future.result()
             self.logger.info(f"Inserted {len(repo_ids)} repositories into DB")
 
-            # Update release data with repo IDs and insert releases
-            if release_data and repo_ids:
-                for i, (content, _) in enumerate(release_data):
-                    if i < len(repo_ids):
-                        release_data[i] = (content, repo_ids[i])
+            # Tạo release_data với repoid chính xác
+            release_data = []
+            if release_repo_map and repo_ids:
+                for idx, content in release_repo_map.items():
+                    if idx < len(repo_ids):  # Đảm bảo không vượt quá số repo_ids
+                        release_data.append((content, repo_ids[idx]))
+
+                # Chèn release với repoid đúng
                 future = self.executor.submit(self.batch_insert_releases, release_data)
                 release_ids = future.result()
                 self.logger.info(f"Inserted {len(release_ids)} releases into DB")
 
-                # Map release IDs to commit requests and yield in parallel
-                release_id_map = {repo_ids[i]: release_id for i, release_id in enumerate(release_ids) if release_id}
-                for i, (owner, repo_name, tag_name) in enumerate(commit_requests):
-                    repo_id = repo_ids[i] if i < len(repo_ids) else None
+                # Ánh xạ release_ids với commit requests
+                release_id_map = {repo_ids[commit_idx]: release_id
+                                  for commit_idx, release_id in zip(release_repo_map.keys(), release_ids)
+                                  if release_id}
+                for owner, repo_name, tag_name, idx in commit_requests:
+                    repo_id = repo_ids[idx] if idx < len(repo_ids) else None
                     if repo_id in release_id_map:
                         for request in self.fetch_commits(owner, repo_name, tag_name, release_id_map[repo_id]):
-                            yield request  # Yield all commit requests concurrently
+                            yield request
 
         self.logger.debug(f"Total crawled: {self.total_crawled}")
         if self.total_crawled >= self.limit:
             self.logger.info(f"Reached limit of {self.limit} repositories.")
             return
 
+        # Phần phân trang giữ nguyên
         page_info = search_data.get("pageInfo", {})
         if self.total_crawled < self.limit:
             self.after_cursor = page_info["endCursor"]
