@@ -1,7 +1,6 @@
-import json
-
-import psycopg2
 import scrapy
+import json
+import psycopg2
 
 from api.config import Config
 from crawler.settings import Settings
@@ -9,19 +8,15 @@ from crawler.settings import Settings
 
 class RepoSpider(scrapy.Spider):
     name = "repos"
-    api_url = "https://api.github.com/graphql"
+    api_url = Settings.api_url
     custom_settings = {
         "USER_AGENT": "GitHubCrawler/1.0",
         "DOWNLOAD_DELAY": 5,
         "LOG_LEVEL": "DEBUG",
         "DOWNLOADER_MIDDLEWARES": {
-            # 'crawler.RandomUserAgentMiddleware.RandomUserAgentMiddleware': 544,
-            'crawler.RateLimitMiddleware.RateLimitMiddleware': 100,
-            # 'scrapy.downloadermiddlewares.retry.RetryMiddleware': 90,
+            'crawler.middleware.rate_limit_middleware.RateLimitMiddleware': 100,
         },
-        # "RETRY_ENABLED": True,
-        # "RETRY_TIMES": 0,  # Tăng số lần retry lên 3
-        # "RETRY_HTTP_CODES": [429, 502, 503, 504],  # Retry cho 502 và các mã lỗi khác
+        "REFERRER_POLICY": "strict-origin-when-cross-origin",  # Giá trị hợp lệ
     }
 
     def __init__(self, limit=5000, *args, **kwargs):
@@ -45,7 +40,7 @@ class RepoSpider(scrapy.Spider):
     def start_requests(self):
         query = """
         query ($first: Int!, $after: String) {
-          search(query: "stars:8000..414047 sort:stars-desc", type: REPOSITORY, first: $first, after: $after) {
+          search(query: "stars:8000..999999999 sort:stars-desc", type: REPOSITORY, first: $first, after: $after) {
             repositoryCount
             edges {
               node {
@@ -83,16 +78,14 @@ class RepoSpider(scrapy.Spider):
             body=json.dumps({"query": query, "variables": variables}),
             callback=self.parse,
             meta={'page': 1, 'original_query': True},
-            errback=self.handle_error  # Thêm xử lý lỗi
+            errback=self.handle_error
         )
 
     def parse(self, response):
         page = response.meta.get('page')
         original_query = response.meta.get('original_query', False)
 
-        # Debug response
         self.logger.debug(f"Response status: {response.status}, headers: {response.headers}")
-
         if response.status != 200:
             self.logger.error(f"Failed to fetch repos: {response.status}, body: {response.text}")
             if response.status == 502:
@@ -117,16 +110,47 @@ class RepoSpider(scrapy.Spider):
             name = repo['name']
             star = repo['stargazerCount']
 
-            self.cursor.execute(
-                """
-                INSERT INTO repo ("user", name, star)
-                VALUES (%s, %s, %s)
-                ON CONFLICT DO NOTHING
-                RETURNING id
-                """,
-                (user, name, star)
-            )
-            self.conn.commit()
+            with self.conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO repo ("user", name, star)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    (user, name, star)
+                )
+                repo_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
+                self.conn.commit()
+
+            if repo_id:
+                query = """
+                    query ($owner: String!, $repo: String!, $first: Int!) {
+                        repository(owner: $owner, name: $repo) {
+                            releases(first: $first, orderBy: {field: CREATED_AT, direction: DESC}) {
+                                nodes {
+                                    name
+                                    tagName
+                                    publishedAt
+                                    description
+                                }
+                            }
+                        }
+                    }
+                    """
+                variables = {"owner": user, "repo": name, "first": 10}  # Tăng lên 10
+                payload = json.dumps({"query": query, "variables": variables})
+                self.logger.debug(f"Sending request to fetch releases for {user}/{name}")
+                yield scrapy.Request(
+                    url=self.api_url,
+                    method='POST',
+                    headers=self.headers,
+                    body=payload,
+                    callback=self.parse_releases,
+                    meta={'repo_id': repo_id, 'owner': user, 'repo': name},
+                    errback=self.handle_error
+                )
+
             self.last_star = star
 
         self.total_crawled += len(repos)
@@ -181,9 +205,95 @@ class RepoSpider(scrapy.Spider):
                 errback=self.handle_error
             )
 
+    def parse_releases(self, response):
+        repo_id = response.meta['repo_id']
+        owner = response.meta['owner']
+        repo = response.meta['repo']
+        release_ids = []
+
+        if response.status == 200:
+            data = json.loads(response.text)
+            releases = data.get("data", {}).get("repository", {}).get("releases", {}).get("nodes", [])
+            self.logger.debug(f"Releases data for {owner}/{repo}: {releases}")
+
+            for release in releases:
+                release_content = f"{release['name']} - {release['tagName']} - {release['publishedAt']} - {release['description']}"
+                self.cursor.execute(
+                    """
+                    INSERT INTO release (content, repoid)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    (release_content, repo_id)
+                )
+                release_id = self.cursor.fetchone()[0] if self.cursor.rowcount > 0 else None
+                self.logger.debug(f"Inserted release: {release_content}, release_id: {release_id}")
+                if release_id:
+                    release_ids.append(release_id)
+                self.conn.commit()
+
+        if release_ids:
+            latest_release_id = release_ids[-1]
+            query = """
+                query ($owner: String!, $repo: String!, $first: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                        defaultBranchRef {
+                            target {
+                                ... on Commit {
+                                    history(first: $first) {
+                                        nodes {
+                                            oid
+                                            message
+                                            committedDate
+                                            author {
+                                                name
+                                                email
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                """
+            variables = {"owner": owner, "repo": repo, "first": 10}  # Tăng lên 10
+            payload = json.dumps({"query": query, "variables": variables})
+            self.logger.debug(f"Sending request to fetch commits for release_id: {latest_release_id}")
+            yield scrapy.Request(
+                url=self.api_url,
+                method='POST',
+                headers=self.headers,
+                body=payload,
+                callback=self.parse_commits,
+                meta={'release_id': latest_release_id},
+                errback=self.handle_error
+            )
+
+    def parse_commits(self, response):
+        release_id = response.meta['release_id']
+
+        if response.status == 200:
+            data = json.loads(response.text)
+            commits = data.get("data", {}).get("repository", {}).get("defaultBranchRef", {}).get("target", {}).get("history", {}).get("nodes", [])
+            self.logger.debug(f"Commits data for release_id {release_id}: {commits}")
+
+            for commit in commits:
+                self.cursor.execute(
+                    """
+                    INSERT INTO "commit" (hash, message, releaseid)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (commit['oid'], commit['message'], release_id)
+                )
+                self.logger.debug(f"Inserted commit: {commit['oid']} for release_id: {release_id}")
+            self.conn.commit()
+
     def handle_error(self, failure):
-        """Xử lý lỗi khi request thất bại"""
         self.logger.error(f"Request failed: {failure}")
+        self.logger.error(f"Failure details: {repr(failure)}")
         if failure.check(scrapy.exceptions.IgnoreRequest):
             self.logger.info("Request ignored due to middleware.")
         else:

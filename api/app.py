@@ -1,14 +1,12 @@
 import json
 
 import psycopg2
-import schedule
 from flask import Flask, jsonify, request
 from scrapy.crawler import CrawlerProcess
-import time
+
 from api.config import Config
-from crawler.GitHubReleasesSpider import GitHubReleasesSpider
-from crawler.repo_spider import RepoSpider
 from crawler.spider import ReleasesSpider
+from crawler.repo_spider import RepoSpider
 
 app = Flask(__name__)
 

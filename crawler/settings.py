@@ -13,6 +13,7 @@ class Settings:
         "Authorization": f"token {GITHUB_TOKEN}",
         "User-Agent": "GitHubCrawler/1.0"
     }
+    api_url = "https://api.github.com/graphql"
 
     # Tùy chọn tối ưu hóa
     # RETRY_TIMES = 5
