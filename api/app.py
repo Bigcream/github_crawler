@@ -4,14 +4,14 @@ import psycopg2
 from flask import Flask, jsonify, request
 from scrapy.crawler import CrawlerProcess
 
-from api.config import Config
-from crawler.spider import ReleasesSpider
-from crawler.repo_spider import RepoSpider
+from github_crawler.config import Config
+from github_crawler.spiders.repo_spider import RepoSpider
 
 app = Flask(__name__)
 
 is_running = False
 # Kết nối PostgreSQL
+
 def get_db_connection():
     return psycopg2.connect(
         host=Config.DB_HOST,
@@ -32,7 +32,7 @@ def fetch_top_repos():
 
     limit = request.args.get("limit", default=5000, type=int)
 
-    # Nếu chưa đủ số lượng, chạy crawler
+    # Nếu chưa đủ số lượng, chạy github_crawler
     if current_count < limit:
         process = CrawlerProcess()
         # process.crawl(GitHubReleasesSpider)
@@ -48,29 +48,6 @@ def fetch_top_repos():
     conn.close()
 
     return jsonify({"status": "success", "repos_count": len(repos), "repos": repos})
-
-
-@app.route("/crawl-releases", methods=["POST"])
-def crawl_releases():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM repo")
-    if cursor.fetchone()[0] == 0:
-        cursor.close()
-        conn.close()
-        return jsonify({"error": "No repos available. Call /top-repos first."}), 400
-
-    cursor.close()
-    conn.close()
-
-    process = CrawlerProcess(settings={
-        "USER_AGENT": "GitHubCrawler/1.0",
-        "DOWNLOAD_DELAY": 1,
-        "LOG_LEVEL": "INFO"
-    })
-    process.crawl(ReleasesSpider)
-    process.start()
-    return jsonify({"status": "crawl_completed"})
 
 
 @app.route("/releases", methods=["GET"])

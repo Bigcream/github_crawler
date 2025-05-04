@@ -1,6 +1,18 @@
 version: "3.9"
 
 services:
+  redis:
+    image: redis:7.2
+    ports:
+      - "6379:6379"
+#    volumes:
+#      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   postgresql:
     image: postgres:14.2
     container_name: postgresql
@@ -13,9 +25,53 @@ services:
       - POSTGRES_USER=crawler
       - POSTGRES_PASSWORD=crawler
       - POSTGRES_DB=github_crawler
-      - POSTGRES_HOST=5432
     command: -p 5432
     volumes:
-     - db:/var/lib/postgresql/data
+      - db:/var/lib/postgresql/data
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_EXPORTER_CHECK_KEYS=celery
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - redis-exporter
+      - celery-exporter
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
+  celery-exporter:
+    image: danihodovic/celery-exporter
+    command: --broker-url=redis://redis:6379/0
+    ports:
+      - "9808:9808"
+    depends_on:
+      - redis
+
 volumes:
   db:
+  redis_data:
+  prometheus_data:
+  grafana_data:
