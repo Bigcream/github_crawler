@@ -1,8 +1,6 @@
 import scrapy
 import json
 import psycopg2
-from psycopg2.extras import execute_values
-from concurrent.futures import ThreadPoolExecutor
 from api.config import Config
 from crawler.settings import Settings
 
@@ -12,18 +10,18 @@ class RepoSpider(scrapy.Spider):
     api_url = Settings.api_url
     custom_settings = {
         "USER_AGENT": "GitHubCrawler/1.0",
-        "DOWNLOAD_DELAY": 2,  # Reduced delay for faster crawling
+        "DOWNLOAD_DELAY": 2,
         "LOG_LEVEL": "DEBUG",
-        "CONCURRENT_REQUESTS": 10,  # Increased to handle 100 parallel requests
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 10,  # Increased for GitHub API
+        # "CONCURRENT_REQUESTS": 10,
+        # "CONCURRENT_REQUESTS_PER_DOMAIN": 10,
         "DOWNLOADER_MIDDLEWARES": {
             'crawler.middleware.rate_limit_middleware.RateLimitMiddleware': 100,
         },
         "SPIDER_MIDDLEWARES": {
             'scrapy.spidermiddlewares.referer.RefererMiddleware': None,
         },
-        "DOWNLOAD_TIMEOUT": 10,  # Timeout 30 giây
-        "AUTOTHROTTLE_ENABLED": True,  # Helps manage load on GitHub API
+        "DOWNLOAD_TIMEOUT": 10,
+        "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_TARGET_CONCURRENCY": 10.0,
     }
 
@@ -40,7 +38,7 @@ class RepoSpider(scrapy.Spider):
             password=Config.DB_PASSWORD,
             port=Config.DB_PORT
         )
-        self.executor = ThreadPoolExecutor(max_workers=8)  # Thread pool for DB writes
+        self.cursor = self.conn.cursor()
         self.after_cursor = None
         self.last_star = None
         self.total_crawled = 0
@@ -110,10 +108,9 @@ class RepoSpider(scrapy.Spider):
             return
 
         repo_data = []
-        release_repo_map = {}  # Ánh xạ giữa repo index và release content
+        release_repo_map = {}
         commit_requests = []
 
-        # Thu thập dữ liệu repository và release
         for idx, edge in enumerate(repos):
             repo = edge['node']
             user = repo['owner']['login']
@@ -127,45 +124,37 @@ class RepoSpider(scrapy.Spider):
             if releases:
                 release = releases[0]
                 release_content = f"{release['name']} - {release['tagName']} - {release['publishedAt']} - {release['description']}"
-                release_repo_map[idx] = release_content  # Gán release content với chỉ số repo
+                release_repo_map[idx] = release_content
                 tag_name = release['tagName']
                 if tag_name:
-                    commit_requests.append((user, name, tag_name, idx))  # Lưu idx để ánh xạ sau
+                    commit_requests.append((user, name, tag_name, idx))
 
-        # Chèn repo và lấy repo_ids
-        if repo_data:
-            future = self.executor.submit(self.batch_insert_repos, repo_data)
-            repo_ids = future.result()
-            self.logger.info(f"Inserted {len(repo_ids)} repositories into DB")
+        repo_ids = self.insert_repos(repo_data)
+        self.logger.info(f"Inserted {len(repo_ids)} repositories into DB")
 
-            # Tạo release_data với repoid chính xác
-            release_data = []
-            if release_repo_map and repo_ids:
-                for idx, content in release_repo_map.items():
-                    if idx < len(repo_ids):  # Đảm bảo không vượt quá số repo_ids
-                        release_data.append((content, repo_ids[idx]))
+        release_data = []
+        if release_repo_map and repo_ids:
+            for idx, content in release_repo_map.items():
+                if idx < len(repo_ids):
+                    release_data.append((content, repo_ids[idx]))
 
-                # Chèn release với repoid đúng
-                future = self.executor.submit(self.batch_insert_releases, release_data)
-                release_ids = future.result()
-                self.logger.info(f"Inserted {len(release_ids)} releases into DB")
+            release_ids = self.insert_releases(release_data)
+            self.logger.info(f"Inserted {len(release_ids)} releases into DB")
 
-                # Ánh xạ release_ids với commit requests
-                release_id_map = {repo_ids[commit_idx]: release_id
-                                  for commit_idx, release_id in zip(release_repo_map.keys(), release_ids)
-                                  if release_id}
-                for owner, repo_name, tag_name, idx in commit_requests:
-                    repo_id = repo_ids[idx] if idx < len(repo_ids) else None
-                    if repo_id in release_id_map:
-                        for request in self.fetch_commits(owner, repo_name, tag_name, release_id_map[repo_id]):
-                            yield request
+            release_id_map = {repo_ids[commit_idx]: release_id
+                              for commit_idx, release_id in zip(release_repo_map.keys(), release_ids)
+                              if release_id}
+            for owner, repo_name, tag_name, idx in commit_requests:
+                repo_id = repo_ids[idx] if idx < len(repo_ids) else None
+                if repo_id in release_id_map:
+                    for request in self.fetch_commits(owner, repo_name, tag_name, release_id_map[repo_id]):
+                        yield request
 
         self.logger.debug(f"Total crawled: {self.total_crawled}")
         if self.total_crawled >= self.limit:
             self.logger.info(f"Reached limit of {self.limit} repositories.")
             return
 
-        # Phần phân trang giữ nguyên
         page_info = search_data.get("pageInfo", {})
         if self.total_crawled < self.limit:
             self.after_cursor = page_info["endCursor"]
@@ -212,55 +201,47 @@ class RepoSpider(scrapy.Spider):
                 errback=self.handle_error
             )
 
-    def batch_insert_repos(self, repos):
-        with psycopg2.connect(
-            host=Config.DB_HOST,
-            database=Config.DB_NAME,
-            user=Config.DB_USER,
-            password=Config.DB_PASSWORD,
-            port=Config.DB_PORT
-        ) as conn:
-            with conn.cursor() as cursor:
-                query = """
-                INSERT INTO repo ("user", name, star)
-                VALUES %s
-                ON CONFLICT DO NOTHING
-                RETURNING id
-                """
-                try:
-                    result = execute_values(cursor, query, repos, fetch=True)
-                    conn.commit()
-                    self.logger.debug(f"Batch inserted {len(result)} repos into DB")
-                    return [row[0] for row in result] if result else []
-                except Exception as e:
-                    self.logger.error(f"Error during batch repo insert: {e}")
-                    conn.rollback()
-                    return []
+    def insert_repos(self, repos):
+        repo_ids = []
+        query = """
+        INSERT INTO repo ("user", name, star)
+        VALUES (%s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        """
+        for repo in repos:
+            try:
+                self.cursor.execute(query, repo)
+                result = self.cursor.fetchone()
+                self.conn.commit()
+                if result:
+                    repo_ids.append(result[0])
+            except Exception as e:
+                self.logger.error(f"Error inserting repo {repo}: {e}")
+                self.conn.rollback()
+        self.logger.debug(f"Inserted {len(repo_ids)} repos into DB")
+        return repo_ids
 
-    def batch_insert_releases(self, releases):
-        with psycopg2.connect(
-            host=Config.DB_HOST,
-            database=Config.DB_NAME,
-            user=Config.DB_USER,
-            password=Config.DB_PASSWORD,
-            port=Config.DB_PORT
-        ) as conn:
-            with conn.cursor() as cursor:
-                query = """
-                INSERT INTO release (content, repoid)
-                VALUES %s
-                ON CONFLICT DO NOTHING
-                RETURNING id
-                """
-                try:
-                    result = execute_values(cursor, query, releases, fetch=True)
-                    conn.commit()
-                    self.logger.debug(f"Batch inserted {len(result)} releases into DB")
-                    return [row[0] for row in result] if result else []
-                except Exception as e:
-                    self.logger.error(f"Error during batch release insert: {e}")
-                    conn.rollback()
-                    return []
+    def insert_releases(self, releases):
+        release_ids = []
+        query = """
+        INSERT INTO release (content, repoid)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        """
+        for release in releases:
+            try:
+                self.cursor.execute(query, release)
+                result = self.cursor.fetchone()
+                self.conn.commit()
+                if result:
+                    release_ids.append(result[0])
+            except Exception as e:
+                self.logger.error(f"Error inserting release {release}: {e}")
+                self.conn.rollback()
+        self.logger.debug(f"Inserted {len(release_ids)} releases into DB")
+        return release_ids
 
     def fetch_commits(self, owner, repo, tag_name, release_id, after=None):
         query = """
@@ -324,9 +305,8 @@ class RepoSpider(scrapy.Spider):
         commits = history.get("nodes", [])
         if commits:
             commit_data = [(commit['oid'], commit['message'], release_id) for commit in commits]
-            future = self.executor.submit(self.batch_insert_commits, commit_data)
-            future.result()  # Ensure completion, but offloaded to thread
-            self.logger.info(f"Batch inserted {len(commit_data)} commits for release_id: {release_id}")
+            self.insert_commits(commit_data)
+            self.logger.info(f"Inserted {len(commit_data)} commits for release_id: {release_id}")
 
         page_info = history.get("pageInfo", {})
         if page_info.get("hasNextPage", False):
@@ -335,26 +315,19 @@ class RepoSpider(scrapy.Spider):
         else:
             self.logger.info(f"Finished fetching all commits for {owner}/{repo}, release_id: {release_id}")
 
-    def batch_insert_commits(self, commits):
-        with psycopg2.connect(
-            host=Config.DB_HOST,
-            database=Config.DB_NAME,
-            user=Config.DB_USER,
-            password=Config.DB_PASSWORD,
-            port=Config.DB_PORT
-        ) as conn:
-            with conn.cursor() as cursor:
-                query = """
-                INSERT INTO "commit" (hash, message, releaseid)
-                VALUES %s
-                ON CONFLICT DO NOTHING
-                """
-                try:
-                    execute_values(cursor, query, commits)
-                    conn.commit()
-                except Exception as e:
-                    self.logger.error(f"Error during batch commit insert: {e}")
-                    conn.rollback()
+    def insert_commits(self, commits):
+        query = """
+        INSERT INTO "commit" (hash, message, releaseid)
+        VALUES (%s, %s, %s)
+        ON CONFLICT DO NOTHING
+        """
+        for commit in commits:
+            try:
+                self.cursor.execute(query, commit)
+                self.conn.commit()
+            except Exception as e:
+                self.logger.error(f"Error inserting commit {commit}: {e}")
+                self.conn.rollback()
 
     def handle_error(self, failure):
         self.logger.error(f"Request failed: {repr(failure)}")
@@ -364,6 +337,6 @@ class RepoSpider(scrapy.Spider):
             self.logger.warning("Unexpected error. Will retry via middleware.")
 
     def closed(self, reason):
-        self.executor.shutdown(wait=True)
+        self.cursor.close()
         self.conn.close()
         self.logger.info(f"Spider closed with reason: {reason}")
