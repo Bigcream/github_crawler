@@ -2,9 +2,17 @@ version: '3.9'
 
 services:
   # RepoSpider instance (1 instance)
+  repo-spider-scrapy-only:
+    image: crawler-github-repo-scrapy:v1.0.0
+    command: scrapy crawl repos -a limit=100
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - monitoring
   repo-spider:
     image: crawler-github-repo:v1.0.0
-    command: scrapy crawl repos -a limit=5000
+    command: scrapy crawl repos -a limit=100
     depends_on:
       - redis
       - postgres
