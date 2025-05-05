@@ -2,8 +2,8 @@ import os
 
 
 BOT_NAME = 'github-crawler'
-SPIDER_MODULES = ['crawler.spider', 'crawler.repo_spider']
-NEWSPIDER_MODULE = 'crawler.spider, crawler.repo_spider'
+SPIDER_MODULES = ['crawler.spider', 'crawler.repo_spider', 'crawler.release_commit_spider']
+NEWSPIDER_MODULE = 'crawler.spider, crawler.repo_spider, crawler.release_commit_spider'
 ROBOTSTXT_OBEY = False
 
 
