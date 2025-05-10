@@ -17,9 +17,9 @@ class RepoSpider(scrapy.Spider):
         "LOG_LEVEL": "DEBUG",
         "CONCURRENT_REQUESTS": 10,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 10,
-        # "DOWNLOADER_MIDDLEWARES": {
-        #     'crawler.middleware.rate_limit_middleware.RateLimitMiddleware': 100,
-        # },
+        "DOWNLOADER_MIDDLEWARES": {
+            'crawler.middleware.rate_limit_middleware.RateLimitMiddleware': 100,
+        },
         "SPIDER_MIDDLEWARES": {
             'scrapy.spidermiddlewares.referer.RefererMiddleware': None,
         },
@@ -32,7 +32,7 @@ class RepoSpider(scrapy.Spider):
         super(RepoSpider, self).__init__(*args, **kwargs)
         self.limit = int(limit)
         self.per_page = 100
-        self.headers = Settings.HEADERS
+        self.Settings = Settings()
         self.conn = psycopg2.connect(
             host=Config.DB_HOST,
             database=Config.DB_NAME,
@@ -87,7 +87,7 @@ class RepoSpider(scrapy.Spider):
         yield scrapy.Request(
             url=self.api_url,
             method='POST',
-            headers=self.headers,
+            headers=self.Settings.get_headers(),
             body=json.dumps({"query": query, "variables": variables}),
             callback=self.parse,
             meta={'page': 1, 'original_query': True},
@@ -100,6 +100,7 @@ class RepoSpider(scrapy.Spider):
 
         self.logger.debug(f"Parsing response for page {page}, status: {response.status}")
         if response.status != 200:
+            self.log_error_to_db("crawler_repo", original_query, response.text, response.status)
             self.logger.error(f"Failed to fetch repos: {response.status}, body: {response.text}")
             return
 
@@ -190,12 +191,34 @@ class RepoSpider(scrapy.Spider):
             yield scrapy.Request(
                 url=self.api_url,
                 method='POST',
-                headers=self.headers,
+                headers=self.Settings.get_headers(),
                 body=json.dumps({"query": query, "variables": variables}),
                 callback=self.parse,
                 meta={'page': page + 1, 'original_query': original_query},
                 errback=self.handle_error
             )
+
+    def log_error_to_db(self, error_type, url, message, status):
+        """Insert error details into the log_error table."""
+        with psycopg2.connect(
+                host=Config.DB_HOST,
+                database=Config.DB_NAME,
+                user=Config.DB_USER,
+                password=Config.DB_PASSWORD,
+                port=Config.DB_PORT
+        ) as conn:
+            with conn.cursor() as cursor:
+                query = """
+                INSERT INTO log_error (type, url, message, status)
+                VALUES (%s, %s, %s, %s)
+                """
+                try:
+                    cursor.execute(query, (error_type, url, message, status))
+                    conn.commit()
+                    self.logger.debug(f"Logged error to DB: {error_type}, {url}, {message}, {status}")
+                except Exception as e:
+                    self.logger.error(f"Failed to log error to DB: {e}")
+                    conn.rollback()
 
     def batch_insert_repos(self, repos):
         with psycopg2.connect(
@@ -223,7 +246,13 @@ class RepoSpider(scrapy.Spider):
                     return []
 
     def handle_error(self, failure):
+        """Handle request failures and log to log_error table."""
         self.logger.error(f"Request failed: {repr(failure)}")
+        error_message = repr(failure)
+        error_type = "crawler_repo"
+        url = failure.request.url if hasattr(failure, 'request') else "N/A"
+
+        self.log_error_to_db(error_type, url, error_message)
         if failure.check(scrapy.exceptions.IgnoreRequest):
             self.logger.info("Request ignored due to middleware.")
         else:

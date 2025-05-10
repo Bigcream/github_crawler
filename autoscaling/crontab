@@ -1,0 +1,1 @@
+*/1 * * * * /usr/bin/python3 /home/lenovo/PycharmProjects/github-crawler/autoscaling >> /home/lenovo/cron.log 2>&1

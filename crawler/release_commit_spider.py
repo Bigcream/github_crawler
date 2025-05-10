@@ -36,7 +36,7 @@ class ReleaseCommitSpider(RedisSpider):
 
     def __init__(self, *args, **kwargs):
         super(ReleaseCommitSpider, self).__init__(*args, **kwargs)
-        self.headers = Settings.HEADERS
+        self.Settings = Settings()
         self.conn = psycopg2.connect(
             host=Config.DB_HOST,
             database=Config.DB_NAME,
@@ -55,10 +55,10 @@ class ReleaseCommitSpider(RedisSpider):
         return scrapy.Request(
             url=self.api_url,
             method='POST',
-            headers=self.headers,
+            headers=self.Settings.get_headers(),
             body=json.dumps({"query": self.get_release_query(), "variables": {"owner": owner, "repo": repo_name}}),
             callback=self.parse_releases,
-            meta={'repo_id': repo_id, 'owner': owner, 'repo_name': repo_name},
+            meta={'repo_id': repo_id, 'owner': owner, 'repo_name': repo_name, 'original_query': self.get_release_query()},
             errback=self.handle_error
         )
 
@@ -85,6 +85,8 @@ class ReleaseCommitSpider(RedisSpider):
         self.logger.debug(f"Parsing releases for {owner}/{repo_name}, repo_id: {repo_id}, status: {response.status}")
 
         if response.status != 200:
+            original_query = response.meta.get('original_query', False)
+            self.log_error_to_db("crawler_commit", original_query, response.text, response.status)
             self.logger.error(f"Failed to fetch releases: {response.status}, body: {response.text}")
             return
 
@@ -144,10 +146,10 @@ class ReleaseCommitSpider(RedisSpider):
         yield scrapy.Request(
             url=self.api_url,
             method='POST',
-            headers=self.headers,
+            headers=self.Settings.get_headers(),
             body=payload,
             callback=self.parse_commits,
-            meta={'release_id': release_id, 'owner': owner, 'repo': repo, 'tag_name': tag_name},
+            meta={'release_id': release_id, 'owner': owner, 'repo': repo, 'tag_name': tag_name, 'original_query': query},
             errback=self.handle_error
         )
 
@@ -159,6 +161,8 @@ class ReleaseCommitSpider(RedisSpider):
         self.logger.debug(f"Parsing commits for {owner}/{repo}, issues_id: {release_id}, status: {response.status}")
 
         if response.status != 200:
+            original_query = response.meta.get('original_query', False)
+            self.log_error_to_db("crawler_commit", original_query, response.text, response.status)
             self.logger.error(f"Failed to fetch commits: {response.status}")
             return
 
@@ -182,6 +186,28 @@ class ReleaseCommitSpider(RedisSpider):
             yield from self.fetch_commits(owner, repo, tag_name, release_id, page_info["endCursor"])
         else:
             self.logger.info(f"Finished fetching all commits for {owner}/{repo}, release_id: {release_id}")
+
+    def log_error_to_db(self, error_type, url, message, status):
+        """Insert error details into the log_error table."""
+        with psycopg2.connect(
+                host=Config.DB_HOST,
+                database=Config.DB_NAME,
+                user=Config.DB_USER,
+                password=Config.DB_PASSWORD,
+                port=Config.DB_PORT
+        ) as conn:
+            with conn.cursor() as cursor:
+                query = """
+                INSERT INTO log_error (type, url, message, status)
+                VALUES (%s, %s, %s, %s)
+                """
+                try:
+                    cursor.execute(query, (error_type, url, message, status))
+                    conn.commit()
+                    self.logger.debug(f"Logged error to DB: {error_type}, {url}, {message}, {status}")
+                except Exception as e:
+                    self.logger.error(f"Failed to log error to DB: {e}")
+                    conn.rollback()
 
     def batch_insert_releases(self, releases):
         with psycopg2.connect(
